@@ -1,40 +1,88 @@
 const MODEL_PRIORITY = [
   "gemini-3.5-flash-lite",
-  "gemini-3.6-flash",
-  "gemini-3.1-flash-lite"
+  "gemini-3.8-flash",
+  "gemini-3.6-flash"
 ];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.type !== "SOLVE_QUESTION") {
-    return false;
+chrome.runtime.onConnect.addListener((port) => {
+  // Keep-alive port held by the content script so Chrome doesn't freeze background tabs
+  if (port.name === "TAB_KEEP_ALIVE") {
+    let disconnected = false;
+    const timer = setInterval(() => {
+      if (!disconnected) {
+        try {
+          port.postMessage({ type: "PONG" });
+        } catch {}
+      }
+      chrome.runtime.getPlatformInfo(() => {});
+    }, 5000);
+
+    port.onDisconnect.addListener(() => {
+      disconnected = true;
+      clearInterval(timer);
+    });
+
+    port.onMessage.addListener((msg) => {
+      if (msg.type === "PING" && !disconnected) {
+        try {
+          port.postMessage({ type: "PONG" });
+        } catch {}
+      }
+    });
+    return;
   }
 
-  // Keep the MV3 service worker awake while waiting on network calls
+  if (port.name !== "SOLVE_BATCH_PORT") return;
+
+  let disconnected = false;
+
   const keepAlive = setInterval(() => {
-    chrome.runtime.getPlatformInfo(() => {});
-  }, 20000);
-
-  (async () => {
-    try {
-      const selectedId = await solveWithGemini(request.payload);
-      sendResponse({ success: true, selectedId });
-    } catch (error) {
-      sendResponse({
-        success: false,
-        status: error.status || 500,
-        error: error.message || "Unknown background error"
-      });
-    } finally {
-      clearInterval(keepAlive);
+    if (!disconnected) {
+      try {
+        port.postMessage({ type: "PONG" });
+      } catch {}
     }
-  })();
+    chrome.runtime.getPlatformInfo(() => {});
+  }, 4000);
 
-  return true;
+  port.onDisconnect.addListener(() => {
+    disconnected = true;
+    clearInterval(keepAlive);
+  });
+
+  port.onMessage.addListener(async (msg) => {
+    if (msg.type === "PING") {
+      if (!disconnected) {
+        try {
+          port.postMessage({ type: "PONG" });
+        } catch {}
+      }
+      return;
+    }
+
+    if (msg.type !== "SOLVE_BATCH") return;
+
+    try {
+      const answers = await solveBatchWithGemini(msg.payload);
+      if (!disconnected) {
+        port.postMessage({ type: "RESULT", success: true, answers });
+      }
+    } catch (error) {
+      if (!disconnected) {
+        port.postMessage({
+          type: "RESULT",
+          success: false,
+          status: error.status || 500,
+          error: error.message || "Unknown background error"
+        });
+      }
+    }
+  });
 });
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -44,8 +92,23 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   }
 }
 
-async function fetchImagePart(url) {
-  const response = await fetchWithTimeout(url, {}, 8000);
+function parseDataUrl(dataUrl) {
+  const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+  if (!match) return null;
+  return {
+    inlineData: {
+      mimeType: match[1],
+      data: match[2]
+    }
+  };
+}
+
+async function fetchImagePart(imageEntry) {
+  if (typeof imageEntry === "string" && imageEntry.startsWith("data:")) {
+    return parseDataUrl(imageEntry);
+  }
+
+  const response = await fetchWithTimeout(imageEntry, {}, 6000);
   if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
 
   const blob = await response.blob();
@@ -82,17 +145,56 @@ async function callModel(model, apiKey, parts) {
           responseSchema: {
             type: "OBJECT",
             properties: {
-              selectedId: {
-                type: "STRING",
-                description: "The exact ID string of the correct answer choice."
+              answers: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    k: { type: "STRING" },
+                    reasoning: {
+                      type: "STRING",
+                      description: "Ultra-brief 5-12 word verification of the fact or math before selecting."
+                    },
+                    ids: {
+                      type: "ARRAY",
+                      items: { type: "STRING" },
+                      description: "1 ID for SINGLE-CHOICE, all matching IDs for MULTI-SELECT, or [] otherwise."
+                    },
+                    textAnswers: {
+                      type: "ARRAY",
+                      description: "Values for each [BLANK id=...] in FILL-IN-THE-BLANK, or [] otherwise.",
+                      items: {
+                        type: "OBJECT",
+                        properties: {
+                          id: { type: "STRING" },
+                          value: { type: "STRING" }
+                        },
+                        required: ["id", "value"]
+                      }
+                    },
+                    dropdownAnswers: {
+                      type: "ARRAY",
+                      description: "Option 'value' for each [DROPDOWN id=...] in DROPDOWN, or [] otherwise.",
+                      items: {
+                        type: "OBJECT",
+                        properties: {
+                          selectId: { type: "STRING" },
+                          value: { type: "STRING" }
+                        },
+                        required: ["selectId", "value"]
+                      }
+                    }
+                  },
+                  required: ["k", "reasoning", "ids", "textAnswers", "dropdownAnswers"]
+                }
               }
             },
-            required: ["selectedId"]
+            required: ["answers"]
           }
         }
       })
     },
-    12000
+    20000
   );
 
   if (!res.ok) {
@@ -109,46 +211,86 @@ async function callModel(model, apiKey, parts) {
   if (!rawJson) {
     const reason = candidate?.finishReason || "EMPTY_RESPONSE";
     const err = new Error(`Model ${model} returned no text (reason: ${reason})`);
-    err.status = 503; // Treat empty/blocked response as transient so fallback model runs
+    err.status = 503;
     throw err;
   }
 
   const parsed = JSON.parse(rawJson);
-  if (!parsed?.selectedId) {
+  if (!Array.isArray(parsed?.answers)) {
     throw new Error(`Model ${model} returned malformed JSON: ${rawJson}`);
   }
 
-  return parsed.selectedId;
+  return parsed.answers;
 }
 
-async function solveWithGemini({ questionText, imageUrls, choices }) {
+async function solveBatchWithGemini(questions) {
   const { geminiApiKey } = await chrome.storage.local.get("geminiApiKey");
   if (!geminiApiKey) {
     throw new Error("Missing Gemini API key. Set it in the extension popup.");
   }
 
-  const formattedChoices = choices
-    .map((c) => `- ID: "${c.id}" | Option: ${c.text}`)
-    .join("\n");
+  const parts = [
+    {
+      text: [
+        "Solve every question accurately using its passage, text, choices/blanks/dropdowns, and image(s).",
+        "- Put a 5-12 word verification in 'reasoning' first.",
+        "- SINGLE-CHOICE: 1 winning ID in 'ids'; [] in 'textAnswers' and 'dropdownAnswers'.",
+        "- MULTI-SELECT: all requested winning IDs in 'ids'; [] in 'textAnswers' and 'dropdownAnswers'.",
+        "- FILL-IN-THE-BLANK: [] in 'ids' and 'dropdownAnswers'; { id, value } for each [BLANK id=\"...\"] in 'textAnswers'.",
+        "- DROPDOWN: [] in 'ids' and 'textAnswers'; { selectId, value } using exact option 'value' for each [DROPDOWN id=\"...\"] in 'dropdownAnswers'.",
+        "Return ONLY the JSON object."
+      ].join("\n")
+    }
+  ];
 
-  const prompt = [
-    "Analyze the passage, question, and any attached images, then choose the single best answer.",
-    "",
-    "QUESTION & PASSAGE:",
-    questionText,
-    "",
-    "ANSWER CHOICES:",
-    formattedChoices
-  ].join("\n");
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    const passageSection = q.passageText ? `PASSAGE:\n${q.passageText}\n\n` : "";
 
-  const parts = [{ text: prompt }];
+    if (q.questionType === "fill_in_the_blank") {
+      parts.push({
+        text: `\n--- Q${i + 1} [k="${q.questionKey}"] [FILL-IN-THE-BLANK] ---\n${passageSection}${q.questionText}`
+      });
+    } else if (q.questionType === "dropdown") {
+      const formattedDropdowns = q.dropdowns
+        .map((dd) => {
+          const opts = dd.options
+            .map((o) => `    value="${o.value}": ${o.text}`)
+            .join("\n");
+          return `  For selectId="${dd.selectId}":\n${opts}`;
+        })
+        .join("\n");
 
-  for (const url of imageUrls) {
-    try {
-      const imagePart = await fetchImagePart(url);
-      parts.push(imagePart);
-    } catch (err) {
-      console.warn("Skipping unreadable image:", url, err);
+      parts.push({
+        text: `\n--- Q${i + 1} [k="${q.questionKey}"] [DROPDOWN] ---\n${passageSection}${q.questionText}\nDROPDOWN OPTIONS:\n${formattedDropdowns}`
+      });
+    } else {
+      const typeLabel =
+        q.questionType === "multi_select"
+          ? "MULTI-SELECT (select all requested options)"
+          : "SINGLE-CHOICE (select 1 option)";
+
+      const formattedChoices = q.choices
+        .map((c) => `  id="${c.id}": ${c.text}`)
+        .join("\n");
+
+      parts.push({
+        text: `\n--- Q${i + 1} [k="${q.questionKey}"] [${typeLabel}] ---\n${passageSection}${q.questionText}\nCHOICES:\n${formattedChoices}`
+      });
+    }
+
+    if (q.images?.length) {
+      const imageResults = await Promise.all(
+        q.images.map((img) =>
+          fetchImagePart(img).catch((err) => {
+            console.warn("Skipping unreadable image:", err);
+            return null;
+          })
+        )
+      );
+      for (const imgPart of imageResults) {
+        if (imgPart) parts.push(imgPart);
+      }
     }
   }
 
@@ -161,7 +303,7 @@ async function solveWithGemini({ questionText, imageUrls, choices }) {
       const isTimeout = err.name === "AbortError";
       if (isTimeout || err.status === 503 || err.status === 429) {
         console.warn(`${model} timed out or busy, trying next model...`);
-        await sleep(1000);
+        await sleep(600);
         continue;
       }
       throw err;
