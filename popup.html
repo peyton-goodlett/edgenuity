@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 250px; padding: 12px; font-family: system-ui, sans-serif; }
+    input[type="password"] { width: 100%; box-sizing: border-box; margin: 6px 0 10px; padding: 6px; }
+    label { font-size: 12px; display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+    button { width: 48%; padding: 8px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <strong>Gemini API Key</strong>
+  <input id="apiKey" type="password" placeholder="AIza..." />
+  <label><input id="autoSubmit" type="checkbox" /> Click Submit at end</label>
+  <div style="display: flex; justify-content: space-between;">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn">Stop</button>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
