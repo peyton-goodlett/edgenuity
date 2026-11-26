@@ -11,8 +11,8 @@
   let isRunning = false;
   const BATCH_SIZE = 4;
   const MAX_CONCURRENT_BATCHES = 2;
-  const MIN_QUIZ_DURATION_MS = 60 * 1000;  // 1 minute
-  const MAX_QUIZ_DURATION_MS = 120 * 1000; // 2 minutes
+  const DEFAULT_MIN_DELAY_SEC = 60;
+  const DEFAULT_MAX_DELAY_SEC = 120;
 
   window.__edgenuityBotStop = () => {
     isRunning = false;
@@ -26,7 +26,6 @@
     );
   }
 
-  // Deadline-based sleep so background tab timer clamping (1s) never drifts or hangs
   const sleep = (ms) =>
     new Promise((resolve) => {
       const end = Date.now() + ms;
@@ -39,7 +38,6 @@
       setTimeout(tick, Math.min(ms, 500));
     });
 
-  // Holds an active extension port while running so Chrome doesn't freeze background tabs
   function startTabKeepAlive() {
     if (!isContextValid()) return () => {};
     let port = null;
@@ -75,10 +73,29 @@
     return chunks;
   }
 
-  function setAutomationState(running, autoSubmit = false) {
+  function normalizeDelayBounds(minDelaySec, maxDelaySec) {
+    const min = Math.max(0, Number.isFinite(minDelaySec) ? minDelaySec : DEFAULT_MIN_DELAY_SEC);
+    const max = Math.max(min, Number.isFinite(maxDelaySec) ? maxDelaySec : DEFAULT_MAX_DELAY_SEC);
+    return { minDelaySec: min, maxDelaySec: max };
+  }
+
+  function setAutomationState(
+    running,
+    autoSubmit = false,
+    minDelaySec = DEFAULT_MIN_DELAY_SEC,
+    maxDelaySec = DEFAULT_MAX_DELAY_SEC
+  ) {
     if (!isContextValid()) return Promise.resolve();
+    const bounds = normalizeDelayBounds(minDelaySec, maxDelaySec);
     return chrome.storage.local
-      .set({ automationState: { isRunning: running, autoSubmit } })
+      .set({
+        automationState: {
+          isRunning: running,
+          autoSubmit,
+          minDelaySec: bounds.minDelaySec,
+          maxDelaySec: bounds.maxDelaySec
+        }
+      })
       .catch(() => {});
   }
 
@@ -755,11 +772,19 @@
     return allAnswers;
   }
 
-  async function runAutomation(autoSubmit) {
+  async function runAutomation(
+    autoSubmit,
+    minDelaySec = DEFAULT_MIN_DELAY_SEC,
+    maxDelaySec = DEFAULT_MAX_DELAY_SEC
+  ) {
     if (isRunning || !isContextValid()) return;
     isRunning = true;
     let transitioningToNextActivity = false;
     const stopTabKeepAlive = startTabKeepAlive();
+    const { minDelaySec: minSec, maxDelaySec: maxSec } = normalizeDelayBounds(
+      minDelaySec,
+      maxDelaySec
+    );
 
     try {
       const prepStatus = await prepareAssessmentScreen(15000);
@@ -777,9 +802,10 @@
 
       while (isRunning && isContextValid()) {
         const quizStartTime = Date.now();
+        const minMs = minSec * 1000;
+        const maxMs = maxSec * 1000;
         const targetQuizDurationMs =
-          Math.floor(Math.random() * (MAX_QUIZ_DURATION_MS - MIN_QUIZ_DURATION_MS + 1)) +
-          MIN_QUIZ_DURATION_MS;
+          Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
 
         console.log("Collecting all questions...");
         const collected = await collectAllQuestions();
@@ -874,7 +900,7 @@
       isRunning = false;
       stopTabKeepAlive();
       if (!transitioningToNextActivity && isContextValid()) {
-        await setAutomationState(false, false);
+        await setAutomationState(false, false, minSec, maxSec);
       }
     }
   }
@@ -895,7 +921,7 @@
 
       setTimeout(() => {
         if (isContextValid() && isAssessmentFrame()) {
-          runAutomation(state.autoSubmit);
+          runAutomation(state.autoSubmit, state.minDelaySec, state.maxDelaySec);
         }
       }, 700);
     });
@@ -912,8 +938,8 @@
       if (!isAssessmentFrame()) return;
 
       if (msg.type === "START") {
-        setAutomationState(true, !!msg.autoSubmit);
-        runAutomation(msg.autoSubmit);
+        setAutomationState(true, !!msg.autoSubmit, msg.minDelaySec, msg.maxDelaySec);
+        runAutomation(msg.autoSubmit, msg.minDelaySec, msg.maxDelaySec);
       }
     });
   }
