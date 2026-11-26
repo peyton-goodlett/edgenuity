@@ -6,6 +6,14 @@ const MODEL_PRIORITY = [
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg?.type === "REQUEST_NEXT_ACTIVITY" && sender.tab?.id) {
+    chrome.tabs
+      .sendMessage(sender.tab.id, { type: "CLICK_OUTER_NEXT_ACTIVITY" }, { frameId: 0 })
+      .catch((err) => console.warn("Could not reach top player frame:", err.message));
+  }
+});
+
 chrome.runtime.onConnect.addListener((port) => {
   // Keep-alive port held by the content script so Chrome doesn't freeze background tabs
   if (port.name === "TAB_KEEP_ALIVE") {

@@ -38,6 +38,8 @@
       setTimeout(tick, Math.min(ms, 500));
     });
 
+  const rawSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
   function startTabKeepAlive() {
     if (!isContextValid()) return () => {};
     let port = null;
@@ -124,6 +126,46 @@
       style.visibility !== "hidden" &&
       el.getClientRects().length > 0
     );
+  }
+
+  function isOuterNextButtonEnabled(btn) {
+    if (!isElementVisible(btn)) return false;
+    if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return false;
+    if (btn.classList.contains("disabled") || btn.classList.contains("ui-state-disabled")) {
+      return false;
+    }
+    const style = window.getComputedStyle(btn);
+    if (style.pointerEvents === "none") return false;
+    return true;
+  }
+
+  async function clickOuterNextActivity(timeoutMs = 12000) {
+    const start = Date.now();
+    const activityName = document.getElementById("activity-title")?.innerText?.trim() || "";
+
+    while (Date.now() - start < timeoutMs) {
+      if (!isContextValid()) return false;
+
+      const nextLink =
+        document.querySelector(".mainfoot .footnav.goRight") ||
+        Array.from(document.querySelectorAll(".mainfoot a")).find((a) =>
+          /next activity/i.test(a.innerText)
+        );
+
+      if (nextLink && isOuterNextButtonEnabled(nextLink)) {
+        await rawSleep(400);
+        nextLink.click();
+        console.log(
+          `Clicked outer Next Activity button${activityName ? ` (after "${activityName}")` : ""}.`
+        );
+        return true;
+      }
+
+      await rawSleep(250);
+    }
+
+    console.warn("Outer Next Activity button was not available or remained disabled.");
+    return false;
   }
 
   function getVisibleTextInputs(contents) {
@@ -518,7 +560,7 @@
     return false;
   }
 
-  async function waitForAndClickNextActivity(timeoutMs = 15000) {
+  async function waitForAndClickNextActivity(timeoutMs = 6000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       if (!isRunning || !isContextValid()) return false;
@@ -878,9 +920,10 @@
           console.log("Clicked Submit. Checking for confirmation modal...");
 
           await waitForAndConfirmSubmit(5000);
-          console.log("Waiting for next activity alert...");
+          console.log("Waiting for next activity prompt...");
 
-          const clickedNextActivity = await waitForAndClickNextActivity();
+          // 1. Standard quiz overlay ("Click here to continue")
+          const clickedNextActivity = await waitForAndClickNextActivity(6000);
           if (clickedNextActivity) {
             transitioningToNextActivity = true;
             await sleep(1000);
@@ -890,6 +933,11 @@
               await sleep(350);
               continue;
             }
+          } else if (isRunning && isContextValid()) {
+            // 2. Unit Test Review (no continue overlay; use outer player's Next Activity button)
+            console.log("No continue overlay found; requesting outer player Next Activity...");
+            transitioningToNextActivity = true;
+            chrome.runtime.sendMessage({ type: "REQUEST_NEXT_ACTIVITY" }).catch(() => {});
           }
         }
 
@@ -928,6 +976,13 @@
 
     chrome.runtime.onMessage.addListener((msg) => {
       if (!isContextValid()) return;
+
+      if (msg.type === "CLICK_OUTER_NEXT_ACTIVITY") {
+        if (window === window.top) {
+          clickOuterNextActivity(12000);
+        }
+        return;
+      }
 
       if (msg.type === "STOP") {
         isRunning = false;
